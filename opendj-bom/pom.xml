@@ -34,7 +34,14 @@
     <description>
         Provides a list of Wren:DS dependencies which are known to be compatible with each other.
     </description>
-
+    
+    <distributionManagement>
+        <site>
+            <id>local</id>
+            <url>file:${maven.multiModuleProjectDirectory}/target/deploy/</url>
+        </site>
+    </distributionManagement>
+    
     <repositories>
         <repository>
             <id>wrensecurity-releases</id>

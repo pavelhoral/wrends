@@ -13,21 +13,10 @@
   information: "Portions Copyright [year] [name of copyright owner]".
 
   Copyright 2016 ForgeRock AS.
+  Portions copyright 2025 Wren Security
 -->
-<project name="${project.name}"
-         xmlns="http://maven.apache.org/DECORATION/1.0.1"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/DECORATION/1.0.1
-                             http://maven.apache.org/xsd/decoration-1.0.1.xsd">
-
-    <!--
-        Use https://github.com/andriusvelykis/blank-maven-skin, which is Apache 2.0.
-        Pages are rendered in vanilla HTML referencing an empty ./css/site.css stylesheet.
-    -->
-    <skin>
-        <groupId>lt.velykis.maven.skins</groupId>
-        <artifactId>blank-maven-skin</artifactId>
-        <version>1.0.0</version>
-    </skin>
-    <body />
-</project>
+<site name="${project.name}"
+    xmlns="http://maven.apache.org/SITE/2.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/SITE/2.0.0 https://maven.apache.org/xsd/site-2.0.0.xsd">
+</site>

@@ -13,13 +13,12 @@
   information: "Portions Copyright [year] [name of copyright owner]".
 
   Copyright 2011-2016 ForgeRock AS.
-  Portions Copyright 2022 Wren Security.
+  Portions Copyright 2022-2025 Wren Security.
 -->
-<project name="${project.name}"
- xmlns="http://maven.apache.org/DECORATION/1.0.1"
- xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
- xsi:schemaLocation="http://maven.apache.org/DECORATION/1.0.1
-                     http://maven.apache.org/xsd/decoration-1.0.1.xsd">
+<site name="${project.name}"
+    xmlns="http://maven.apache.org/SITE/2.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/SITE/2.0.0 https://maven.apache.org/xsd/site-2.0.0.xsd">
 
  <publishDate position="right" format="yyyy.MM.dd" />
  <version position="right" />
@@ -67,4 +66,4 @@
   <siteSearchFQDN>wrensecurity.org</siteSearchFQDN>
  </custom>
 
-</project>
+</site>
