@@ -97,21 +97,34 @@ Mark the public package experimental in Javadoc, keep `.internal` out of the OSG
 
 ### What a server span measures
 
-The server span covers the full inbound request: accepted, queued, executed, response
-sent. That spans three points in the operation lifecycle, so it takes three call sites.
+The server span starts when the operation is accepted and ends when its execution returns,
+which covers queue wait, processing, response transmission and post-response processing.
 
 ```
-LDAPClientConnection.addOperationInProgress(op)   :1135   <- span starts here
-    connectionHandler.getQueueingStrategy().enqueueRequest(op)   :1174
+LDAPClientConnection.addOperationInProgress(op)   :1135   <- span starts
+    enqueueRequest(op)                            :1174
         [ queue wait ]
-        operation.run()                                    <- context activated here
-            [ processing ]
-LDAPClientConnection.sendResponse(op)             :657     <- span ends here
+        runOperation(op)                                   <- scope opens, queue time recorded
+            operation.run()
+                [ processing ]
+                sendResponse(op)                  :657     <- "response.sent" event
+                [ post-response plugins ]
+        <- scope closes, span ends
 ```
 
-Record the queue wait explicitly as `ldap.queue_time`, computed at completion from the span
-start and `Operation.getProcessingStartTime()`. Under overload this is the number that
-explains an otherwise unattributed gap between the client span and server processing.
+Ending the span where the scope closes, rather than at `sendResponse`, is what keeps the
+context tree coherent. `SearchOperationBasis:780-784` calls `sendResponse(this)` and then
+`invokePostResponsePlugins()`, both inside `run()` and therefore both inside the active
+scope. A span that ended at `sendResponse` would still be `Span.current()` during
+post-response processing, so any child created there — by a plugin, or by agent
+instrumentation of a library call — would start after its parent had ended.
+
+The cost is that span duration is slightly broader than client-visible response latency.
+Record the `response.sent` event so that boundary remains readable in a waterfall.
+
+Queue time is measured directly rather than reconstructed: `LdapOperationTrace` stores
+`System.nanoTime()` at accept, and `runOperation` records `ldap.queue_time` from the same
+monotonic clock at the moment execution begins.
 
 ### Persistent searches are not traced
 
@@ -165,7 +178,7 @@ Client and server must agree on it exactly, or cross-side correlation is worthle
 | `ldap.response.control_oids` | `["2.16.840.1.113730.3.4.4"]` | both | string array |
 | `ldap.search.scope` | `wholeSubtree` | both | |
 | `ldap.search.filter` | `(&(objectClass=?)(uid=?))` | both | off by default, shape only |
-| `ldap.queue_time` | `12` | server | milliseconds between accept and `getProcessingStartTime()` |
+| `ldap.queue_time` | `12` | server | milliseconds between accept and start of execution |
 | `ldap.search.entries_returned` | `1` | both | |
 | `ldap.search.page_size` | `500` | both | from the paged-results control |
 | `ldap.response.password_policy.error` | `passwordExpired` | both | high-signal, non-PII |
@@ -376,8 +389,8 @@ result-code set, propagation, and the obfuscation limits.
 
 ## Server instrumentation
 
-Three call sites in `opendj-server-legacy`, one per lifecycle concern, plus a `ServerTelemetry`
-helper that keeps OTel types out of the server code.
+Three call sites in `opendj-server-legacy`, plus a `ServerTelemetry` helper that keeps OTel
+types out of the server code. Exactly one of them ends the span on the normal path.
 
 ### 1. Accept — start the span
 
@@ -389,21 +402,29 @@ the enqueue:
 ```java
 private void addOperationInProgress(Operation operation) throws DirectoryException {
     ...                                    // existing checks
-    ServerTelemetry.start(operation);      // attaches Span + Context to the Operation
+    ServerTelemetry.start(operation);      // attaches Span + Context, stamps acceptedNanos
     try {
         connectionHandler.getQueueingStrategy().enqueueRequest(operation);
-    } catch (Throwable t) {
-        ServerTelemetry.fail(operation, t);
-        throw t;
+    } catch (DirectoryException de) {
+        ServerTelemetry.reject(operation, de.getResultCode());
+        throw de;
     }
 }
 ```
 
 This is the common path for all nine traced operation types — abandon, add, bind, compare,
 delete, extended, modify, modifyDN, search (`:1638`–`:2161`). Operations rejected by the
-preceding checks are not traced, which is the intended behaviour: they never became work.
+preceding checks are not traced, which is intended: they never became work.
 
-### 2. Execute — activate the context
+**Enqueue rejection is a defined terminal path, not a leak.** The existing handler removes
+the operation from `operationsInProgress` and rethrows (`:1177-1188`); the caller then
+writes an LDAP error response directly rather than through `sendResponse(Operation)` — see
+`processAddRequest:1686-1699` and its siblings. Such a span therefore ends at rejection,
+before that response is written, and carries the `DirectoryException`'s result code rather
+than being recorded as an exception. Document that; it is the one span whose duration
+excludes response transmission.
+
+### 2. Execute — activate the context and end the span
 
 `Operation.run()` is invoked from six places: `SynchronousStrategy:39`,
 `BoundedWorkQueueStrategy:83,91,247`, `TraditionalWorkerThread:166`, and
@@ -412,47 +433,67 @@ code across four files:
 
 ```java
 static void runOperation(Operation operation) {
-    try (Scope ignored = ServerTelemetry.contextOf(operation).makeCurrent()) {
+    LdapOperationTrace trace = ServerTelemetry.traceOf(operation);
+    trace.recordQueueTime();               // now - acceptedNanos, one monotonic clock
+    try (Scope ignored = trace.context().makeCurrent()) {
         operation.run();
+    } finally {
+        trace.complete(operation);         // runs after the scope has closed
     }
 }
 ```
 
-Activating the context here — and only here — is what makes spans created inside the
-operation become children: Wren's own future `backend.*` spans, agent-instrumented library
-calls, and plugin instrumentation alike. Without it, only code that knows about
-`Operation.getAttachment()` can parent correctly.
+Two properties come from this shape:
 
-### 3. Respond — end the span
+- **Activating the context here — and only here — is what makes spans created inside the
+  operation become children:** Wren's own future `backend.*` spans, agent-instrumented
+  library calls, and plugin instrumentation alike.
+- **The `finally` is the single normal completion point.** Try-with-resources closes the
+  scope before the `finally` body runs, so the span always ends after it is no longer
+  current, and it ends even when `run()` throws. Abandon needs no special handling: it has
+  no response, but its `run()` returns like any other operation.
 
-`LDAPClientConnection.sendResponse(Operation)` (`:657`) is the common final-response path.
-It already removes the operation from `operationsInProgress` and serializes the outgoing
-message, so completing the span there covers response transmission.
+### 3. Respond — record the result, do not end the span
 
-### Operations that never reach `sendResponse`
+`LDAPClientConnection.sendResponse(Operation)` (`:657`) reads the result off the operation
+and emits a `response.sent` span event. It must **not** end the span.
 
-Two cases need explicit handling or the span leaks:
+It also must not be confused with the leak guard. `sendResponse` calls
+`removeOperationInProgress()` *before* it builds and writes the message (`:681-687`), so
+completing a trace from the removal itself would end the span before the network write.
+Removal is a fallback for abnormal paths only.
 
-- **Abandon** enters `addOperationInProgress` (`:1638`) but has no response — the code
-  comments say so directly. End its span when `run()` returns.
-- **Connection teardown** mid-operation, and any path that abandons an operation without
-  responding. Guard by ending any still-open span when the operation leaves
-  `operationsInProgress`, and by draining the connection's in-flight operations on
-  disconnect.
+Response-write failure should be visible on the span, which today it is not:
+`sendLDAPMessage(LDAPMessage)` (`:917`) catches `ClosedChannelException` and `Exception`,
+disconnects, and returns `void`, so callers cannot tell whether the write succeeded. It is
+private with few call sites — change it to return `boolean`:
+
+```java
+if (sendLDAPMessage(message)) {
+    ServerTelemetry.responseSent(operation);
+} else {
+    ServerTelemetry.responseFailed(operation);   // sets error.type, status ERROR
+}
+```
+
+### Leak guard
+
+An operation that is queued but never runs — connection teardown, server shutdown — reaches
+neither `runOperation` nor `sendResponse`. End any still-open span when the connection
+drains its in-flight operations on disconnect. This is the only other place that ends a
+span, and it exists solely to prevent leaks.
 
 Unbind never enters this path (`processUnbindRequest:2191` constructs its operation
-separately) and is not in the span model.
-
-Also out of scope: internal operations via `InternalClientConnection`, which never touch
-`LDAPClientConnection` and have no inbound request to represent, and the HTTP/SDK adapter
-path (`SdkConnectionAdapter:275`).
+separately) and is not in the span model. Also out of scope: internal operations via
+`InternalClientConnection`, which have no inbound request to represent, and the HTTP/SDK
+adapter path (`SdkConnectionAdapter:275`).
 
 ### Attributes
 
 Read off `Operation`: `getOperationType()`, `getResultCode()`, `getMessageID()`,
-`getConnectionID()`, `getMatchedDN()`, `getProcessingStartTime()`. `SearchOperation` adds
-`getBaseDN()`, `getScope()`, `getFilter()`, `getEntriesSent()`. Controls come from
-`getRequestControls()` / `getResponseControls()` (`types/Operation.java:116,149`).
+`getConnectionID()`, `getMatchedDN()`. `SearchOperation` adds `getBaseDN()`, `getScope()`,
+`getFilter()`, `getEntriesSent()`. Controls come from `getRequestControls()` /
+`getResponseControls()` (`types/Operation.java:116,149`).
 
 ### Enablement needs no switch
 
@@ -632,8 +673,8 @@ is invisible in a diff that also introduces span logic.
 | PR | Contents | Size | Review focus |
 |---|---|---|---|
 | **7** | Converge the six `operation.run()` call sites — `SynchronousStrategy:39`, `BoundedWorkQueueStrategy:83,91,247`, `TraditionalWorkerThread:166`, `ParallelWorkerThread:168` — onto one `runOperation(Operation)` helper. Pure refactor, no telemetry | ~120 | Behaviour-preserving across all queueing strategies. Route to a reviewer who knows the work queue |
-| **8** | `ServerTelemetry` + the three lifecycle call sites: start in `addOperationInProgress`, activate in `runOperation`, end in `sendResponse`. Abandon handling and the in-flight leak guard | ~450 | Span leaks. Every path that removes an operation from `operationsInProgress` must end its span exactly once |
-| **9** | Attributes off `Operation`, server-side `Filters` adapter, `ldap.queue_time`, persistent-search exclusion | ~350 | Schema conformance with Track A; `isRecording()` guards on the hot path |
+| **8** | `ServerTelemetry` + the lifecycle call sites: start in `addOperationInProgress`, activate and end in `runOperation`, `response.sent` event in `sendResponse`, enqueue-rejection path, disconnect leak guard. `sendLDAPMessage` returns `boolean` | ~450 | That exactly one path ends each span. The span must end after the scope closes, never while it is still current |
+| **9** | Attributes off `Operation`, server-side `Filters` adapter, `ldap.queue_time`, persistent-search exclusion | ~350 | Schema conformance with Track A; `isRecording()` guards on the hot path; queue time from the trace's own monotonic clock |
 | **10** | Admin-framework configuration object for obfuscation mode, filter capture, error result-code set | ~350 | Config plumbing; that it configures policy, not whether OpenTelemetry exists |
 
 PR 7 is the highest-leverage split in this track: it is a behaviour-preserving refactor that
