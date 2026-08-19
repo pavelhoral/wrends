@@ -6,8 +6,8 @@ Status: proposal · Target: 5.2.0 · Java 17
 
 Add one Maven module, `wrends-telemetry`, holding the shared tracing vocabulary and
 helpers. Instrumentation lives at the natural operation boundaries in the modules that own
-them: a `ConnectionFactory` decorator for the LDAP client, an `AccessLogPublisher` for the
-directory server.
+them: a `ConnectionFactory` decorator for the LDAP client, and native call sites on the
+operation lifecycle for the directory server.
 
 ```
 opendj-core  ──────────────┐
@@ -97,35 +97,33 @@ Mark the public package experimental in Javadoc, keep `.internal` out of the OSG
 
 ### What a server span measures
 
-`AccessLogPublisher` provides request and response hooks without touching operation
-dispatch, but the response hook is not the end of server handling. In
-`SearchOperationBasis:774-784` the order is:
+The server span covers the full inbound request: accepted, queued, executed, response
+sent. That spans three points in the operation lifecycle, so it takes three call sites.
 
 ```
-responseSent.compareAndSet(false, true)
-    logSearchResultDone(this)        <- publisher hook fires here
-    clientConnection.sendResponse(this)
-    invokePostResponsePlugins()
+LDAPClientConnection.addOperationInProgress(op)   :1135   <- span starts here
+    connectionHandler.getQueueingStrategy().enqueueRequest(op)   :1174
+        [ queue wait ]
+        operation.run()                                    <- context activated here
+            [ processing ]
+LDAPClientConnection.sendResponse(op)             :657     <- span ends here
 ```
 
-A publisher-based span therefore measures **LDAP operation processing latency** — request
-accepted through result prepared — excluding response transmission and post-response
-plugins. That is a useful measurement, and it must be named as such in the configuration
-reference and the README; it is not full server request/response latency.
-
-Producing a conventional `SERVER` span covering complete handling requires an explicit call
-site after `sendResponse()`, not a different publisher hook. That is deferred.
+Record the queue wait explicitly as `ldap.queue_time`, computed at completion from the span
+start and `Operation.getProcessingStartTime()`. Under overload this is the number that
+explains an otherwise unattributed gap between the client span and server processing.
 
 ### Persistent searches are not traced
 
-The same code path warns that it "could be multithreaded in the event of a persistent
-search" (`SearchOperationBasis:777`). For a persistent search, `logSearchResultDone` fires
-only when the search finally terminates — potentially hours later. A span held open that
-long is worse than no span: it is invisible to the backend until it ends, and it distorts
-every latency aggregate it lands in.
+A persistent search does not complete when its initial phase does — the final response is
+sent only when the search terminates, potentially hours later, and the server warns that
+this path "could be multithreaded in the event of a persistent search"
+(`SearchOperationBasis:777`). A span held open that long is worse than no span: it is
+invisible to the backend until it ends, and it distorts every latency aggregate it lands in.
 
-Detect the persistent-search request control and skip tracing the operation. Streaming-phase
-observability belongs in metrics or span events, which is a separate decision.
+Detect the persistent-search request control at the start call site and skip tracing the
+operation. Streaming-phase observability belongs in metrics or span events, which is a
+separate decision.
 
 ### Span kinds and names
 
@@ -167,6 +165,7 @@ Client and server must agree on it exactly, or cross-side correlation is worthle
 | `ldap.response.control_oids` | `["2.16.840.1.113730.3.4.4"]` | both | string array |
 | `ldap.search.scope` | `wholeSubtree` | both | |
 | `ldap.search.filter` | `(&(objectClass=?)(uid=?))` | both | off by default, shape only |
+| `ldap.queue_time` | `12` | server | milliseconds between accept and `getProcessingStartTime()` |
 | `ldap.search.entries_returned` | `1` | both | |
 | `ldap.search.page_size` | `500` | both | from the paged-results control |
 | `ldap.response.password_policy.error` | `passwordExpired` | both | high-signal, non-PII |
@@ -323,11 +322,9 @@ try (Scope scope = trace.context().makeCurrent()) {
 }
 ```
 
-That is a separate concern from span lifetime, and it likely justifies one small
-operation-dispatch call site rather than making the access-log publisher own a thread-local.
-
-The client path does not use this shape: it starts the span in the `*Async` method and
-completes it from the promise callback.
+On the server that block is the `runOperation` helper described below, and it is the only
+place a `Scope` is opened. The client path does not use this shape at all: it starts the
+span in the `*Async` method and completes it from the promise callback.
 
 ## Client instrumentation
 
@@ -345,19 +342,18 @@ TelemetryConnectionFactory          <- one CLIENT span per logical operation
 Because placement is explicit, the decorator chain never double-counts and no span
 suppression logic is needed.
 
-### Extend `AbstractAsynchronousConnection`, not `AbstractConnectionWrapper`
+### Base class
 
-`AbstractConnectionWrapper.add(request)` delegates straight to `connection.add(request)`
-(`AbstractConnectionWrapper.java:82-84`) — it does not route synchronous calls through the
-async methods, so overriding only `*Async` on that base class silently misses every
-blocking call in the application.
+`TelemetryConnection` extends `AbstractAsynchronousConnection` and holds the delegate as a
+field. That base class implements every synchronous method as
+`blockingGetOrThrow(xxxAsync(request))` (`AbstractAsynchronousConnection.java:45-83`), so
+instrumenting the nine `*Async` methods covers the blocking API too. The cost is
+hand-implementing about ten non-operation methods (`close`, `isValid`, listener
+registration, …); the convenience overloads on `AbstractConnection` come along correctly.
 
-`AbstractAsynchronousConnection` implements every synchronous method as
-`blockingGetOrThrow(xxxAsync(request))` (`AbstractAsynchronousConnection.java:45-83`).
-Extending it and holding the delegate as a field means instrumenting the nine `*Async`
-methods covers the blocking API for free, at the cost of hand-implementing about ten
-non-operation methods (`close`, `isValid`, listener registration, …). The convenience
-overloads on `AbstractConnection` come along correctly.
+`AbstractConnectionWrapper` is not usable here: its synchronous methods delegate straight to
+the wrapped connection (`AbstractConnectionWrapper.java:82-84`) instead of routing through
+the async ones, so instrumenting `*Async` alone would miss every blocking call.
 
 The same applies to `LDAPConnectionFactory.getConnection()`, which is
 `getConnectionAsync().getOrThrowUninterruptibly()` (`LDAPConnectionFactory.java:440`).
@@ -380,23 +376,106 @@ result-code set, propagation, and the obfuscation limits.
 
 ## Server instrumentation
 
-Implement `AccessLogPublisher<OpenTelemetryAccessLogPublisherCfg>` in
-`opendj-server-legacy`.
+Three call sites in `opendj-server-legacy`, one per lifecycle concern, plus a `ServerTelemetry`
+helper that keeps OTel types out of the server code.
 
-- Start the span in `logXxxRequest`, complete it in `logXxxResponse` /
-  `logSearchResultDone`.
-- Attributes come off `Operation`: `getOperationType()`, `getResultCode()`,
-  `getMessageID()`, `getConnectionID()`, `getMatchedDN()`, `getProcessingTime()`.
-  `SearchOperation` adds `getBaseDN()`, `getScope()`, `getFilter()`, `getEntriesSent()`.
-- Controls come from `getRequestControls()` / `getResponseControls()`
-  (`types/Operation.java:116,149`). The server already has a `shouldLogControlOids()` notion
-  in its publishers; align the configuration naming with it.
-- Config plumbing follows `opendj-server-example-plugin`: a `*Configuration.xml`
-  admin-framework definition, `Package.xml`, and a schema LDIF. This is the least familiar
-  part of the work and deserves explicit budget.
+### 1. Accept — start the span
 
-Using the publisher SPI means runtime enable/disable and configuration come for free
-through the admin framework, and operation dispatch is untouched.
+`LDAPClientConnection.addOperationInProgress(Operation)` (`:1135`) receives the fully
+constructed operation, performs the disconnect-in-progress and duplicate-message-ID checks,
+then hands it to `enqueueRequest()` (`:1174`). Start the span after those checks and before
+the enqueue:
+
+```java
+private void addOperationInProgress(Operation operation) throws DirectoryException {
+    ...                                    // existing checks
+    ServerTelemetry.start(operation);      // attaches Span + Context to the Operation
+    try {
+        connectionHandler.getQueueingStrategy().enqueueRequest(operation);
+    } catch (Throwable t) {
+        ServerTelemetry.fail(operation, t);
+        throw t;
+    }
+}
+```
+
+This is the common path for all nine traced operation types — abandon, add, bind, compare,
+delete, extended, modify, modifyDN, search (`:1638`–`:2161`). Operations rejected by the
+preceding checks are not traced, which is the intended behaviour: they never became work.
+
+### 2. Execute — activate the context
+
+`Operation.run()` is invoked from six places: `SynchronousStrategy:39`,
+`BoundedWorkQueueStrategy:83,91,247`, `TraditionalWorkerThread:166`, and
+`ParallelWorkerThread:168`. Converge them on one helper rather than scattering OTel-specific
+code across four files:
+
+```java
+static void runOperation(Operation operation) {
+    try (Scope ignored = ServerTelemetry.contextOf(operation).makeCurrent()) {
+        operation.run();
+    }
+}
+```
+
+Activating the context here — and only here — is what makes spans created inside the
+operation become children: Wren's own future `backend.*` spans, agent-instrumented library
+calls, and plugin instrumentation alike. Without it, only code that knows about
+`Operation.getAttachment()` can parent correctly.
+
+### 3. Respond — end the span
+
+`LDAPClientConnection.sendResponse(Operation)` (`:657`) is the common final-response path.
+It already removes the operation from `operationsInProgress` and serializes the outgoing
+message, so completing the span there covers response transmission.
+
+### Operations that never reach `sendResponse`
+
+Two cases need explicit handling or the span leaks:
+
+- **Abandon** enters `addOperationInProgress` (`:1638`) but has no response — the code
+  comments say so directly. End its span when `run()` returns.
+- **Connection teardown** mid-operation, and any path that abandons an operation without
+  responding. Guard by ending any still-open span when the operation leaves
+  `operationsInProgress`, and by draining the connection's in-flight operations on
+  disconnect.
+
+Unbind never enters this path (`processUnbindRequest:2191` constructs its operation
+separately) and is not in the span model.
+
+Also out of scope: internal operations via `InternalClientConnection`, which never touch
+`LDAPClientConnection` and have no inbound request to represent, and the HTTP/SDK adapter
+path (`SdkConnectionAdapter:275`).
+
+### Attributes
+
+Read off `Operation`: `getOperationType()`, `getResultCode()`, `getMessageID()`,
+`getConnectionID()`, `getMatchedDN()`, `getProcessingStartTime()`. `SearchOperation` adds
+`getBaseDN()`, `getScope()`, `getFilter()`, `getEntriesSent()`. Controls come from
+`getRequestControls()` / `getResponseControls()` (`types/Operation.java:116,149`).
+
+### Enablement needs no switch
+
+`GlobalOpenTelemetry` returns a no-op implementation when no agent has installed an SDK, so
+the default posture is already "off":
+
+```
+no OTel/Datadog agent  ->  no-op API  ->  no spans, negligible cost
+agent present          ->  real SDK   ->  tracing works
+```
+
+Operators enable tracing with `java -javaagent:opentelemetry-javaagent.jar …`. There is no
+enable flag whose state can disagree with whether an SDK is actually installed.
+
+Wren-specific policy still needs configuration — obfuscation mode, filter capture, the
+propagation trust allowlist, error result-code set. Give that a dedicated admin-framework
+configuration object following `opendj-server-example-plugin` (a `*Configuration.xml`
+definition, `Package.xml`, schema LDIF). It configures *how* Wren describes operations, not
+*whether* OpenTelemetry exists.
+
+Because these call sites sit on the request hot path, the no-op path must cost
+approximately nothing: no allocation, no string building, no obfuscation before
+`isRecording()`. Benchmark with no agent installed as part of the work.
 
 ## Trace context propagation
 
@@ -406,8 +485,8 @@ through the admin framework, and operation dispatch is untouched.
 `getValue()`; the SDK's `org.forgerock.opendj.ldap.controls.Control` is an unrelated
 interface. One class cannot satisfy both, and `wrends-telemetry` must not depend back on
 `opendj-server-legacy`. So `TraceContextCodec` holds the wire format,
-`TraceContextRequestControl` implements the SDK interface for the client, and the server
-publisher decodes directly:
+`TraceContextRequestControl` implements the SDK interface for the client, and the server's
+start call site decodes directly:
 
 ```java
 for (org.opends.server.types.Control c : operation.getRequestControls()) {
@@ -481,8 +560,10 @@ on a failed bind, and no PII in any attribute or span name.
 - Add the `wrends-telemetry` dependency to `opendj-server-legacy` only.
 - Configure `maven-bundle-plugin`: export the public package, keep `.internal` private.
 - No `japicmp` baseline for the new module; no `opendj-bom` entry while the schema settles.
-- Wire the publisher into the server distribution via `opendj-packages`.
 - Third-party license entry (`src/license/THIRD-PARTY.properties`) for `opentelemetry-api`.
+
+No `opendj-packages` work: the call sites live in `opendj-server-legacy`, which already
+ships in the distribution.
 
 ## Effort and sequencing
 
@@ -491,33 +572,33 @@ on a failed bind, and no PII in any attribute or span name.
 | 0 | Semantic conventions and context lifecycle — settle the sections above | 1 day |
 | 1 | Module skeleton: vocabulary, `DirectoryTelemetry`, `LdapOperationTrace`, obfuscation | 3 days |
 | 2 | Client: `TelemetryConnectionFactory` / `TelemetryConnection` + tests | 1 week |
-| 3 | Server: `AccessLogPublisher` + admin config + tests | 1 week |
+| 3 | Server: lifecycle call sites, `ServerTelemetry`, admin config + tests | 1.5 weeks |
 | 4 | Propagation: codec, client injection, server extraction | 3 days |
 | 5 | Datadog and OTel agent verification | 2 days |
 
-Roughly 3.5–4 weeks for one engineer; phases 2 and 3 parallelize across two once phase 1
+Roughly 4–4.5 weeks for one engineer; phases 2 and 3 parallelize across two once phase 1
 lands.
 
 Do the client before the server. It validates the phase 0 vocabulary against a real
 consumer, and it is the side that cannot be fixed later by editing application code.
 
-Deferred: `backend.*` child spans, full-handling server spans via a post-`sendResponse()`
-call site, persistent-search observability, metrics, and any instrumentation of
-`opendj-server` — a 21-file interface skeleton with no operation dispatch, and upstream of
-the legacy module (`opendj-server-legacy/pom.xml:161`).
+Deferred: `backend.*` child spans, persistent-search observability, metrics, the HTTP/SDK
+adapter path, and any instrumentation of `opendj-server` — a 21-file interface skeleton with
+no operation dispatch, and upstream of the legacy module
+(`opendj-server-legacy/pom.xml:161`).
 
 ## Pull request breakdown
 
 Two rules make every PR independently mergeable:
 
 1. **Every PR leaves the build green.** No PR depends on a later one to compile or pass.
-2. **Nothing emits a span until an operator configures it.** The module is inert on the
-   classpath, the client wrapper is opt-in by construction, and the server publisher is
-   disabled until an admin config entry exists. There is no big-bang merge and no flag-flip
-   PR.
+2. **Nothing emits a span unless an agent supplies an SDK.** `GlobalOpenTelemetry` is a
+   no-op without one, and the client wrapper is opt-in by construction. There is no
+   big-bang merge and no flag-flip PR.
 
-All thirteen PRs can therefore land on `main` without changing the behaviour of a running
-directory. The first behaviour change happens when someone edits their config.
+All fourteen PRs can therefore land on `main` without changing the observable behaviour of a
+running directory. The server call sites do execute on the hot path, so each carries a
+no-agent benchmark showing the no-op cost.
 
 Review the span schema and context lifecycle against this document before PR 1 opens — they
 are the expensive things to change once dashboards and monitors exist.
@@ -550,52 +631,57 @@ is invisible in a diff that also introduces span logic.
 
 | PR | Contents | Size | Review focus |
 |---|---|---|---|
-| **7** | `OpenTelemetryAccessLogPublisher` + `*Configuration.xml`, `Package.xml`, schema LDIF — registers and configures, emits nothing | ~400 | Admin-framework plumbing; route to a reviewer who knows that framework |
-| **8** | Span start/complete in the log hooks, `setAttachment` carry, attributes, server-side `Filters` adapter, persistent-search exclusion | ~450 | Hook pairing, the thread-handoff assumption, and that the span is documented as processing latency |
-| **9** | `opendj-packages` wiring into the server distribution | ~50 | Packaging only |
+| **7** | Converge the six `operation.run()` call sites — `SynchronousStrategy:39`, `BoundedWorkQueueStrategy:83,91,247`, `TraditionalWorkerThread:166`, `ParallelWorkerThread:168` — onto one `runOperation(Operation)` helper. Pure refactor, no telemetry | ~120 | Behaviour-preserving across all queueing strategies. Route to a reviewer who knows the work queue |
+| **8** | `ServerTelemetry` + the three lifecycle call sites: start in `addOperationInProgress`, activate in `runOperation`, end in `sendResponse`. Abandon handling and the in-flight leak guard | ~450 | Span leaks. Every path that removes an operation from `operationsInProgress` must end its span exactly once |
+| **9** | Attributes off `Operation`, server-side `Filters` adapter, `ldap.queue_time`, persistent-search exclusion | ~350 | Schema conformance with Track A; `isRecording()` guards on the hot path |
+| **10** | Admin-framework configuration object for obfuscation mode, filter capture, error result-code set | ~350 | Config plumbing; that it configures policy, not whether OpenTelemetry exists |
 
-PR 7 landing empty is deliberate: its reviewer should be able to approve the config
-plumbing without forming an opinion on tracing.
+PR 7 is the highest-leverage split in this track: it is a behaviour-preserving refactor that
+can be reviewed and merged on work-queue correctness alone, before any telemetry is in the
+diff. PR 8 is where the leak risk lives and deserves the most scrutiny.
 
-### Track D — propagation (depends on PRs 5 and 8)
+### Track D — propagation (depends on PRs 5 and 9)
 
 | PR | Contents | Size | Review focus |
 |---|---|---|---|
-| **10** | `TraceContextCodec` + `TraceContextRequestControl` + tests | ~250 | `isCritical()` returns `false`, with a test. Pure wire format |
-| **11** | Client injection — span context, not caller context — opt-in, default off | ~150 | A test asserting the server span is a child, not a sibling |
-| **12** | Server extraction from `org.opends.server.types.Control` + trust allowlist | ~300 | Security review, isolated so the trust boundary is looked at on its own |
+| **11** | `TraceContextCodec` + `TraceContextRequestControl` + tests | ~250 | `isCritical()` returns `false`, with a test. Pure wire format |
+| **12** | Client injection — span context, not caller context — opt-in, default off | ~150 | A test asserting the server span is a child, not a sibling |
+| **13** | Server extraction from `org.opends.server.types.Control` + trust allowlist | ~300 | Security review, isolated so the trust boundary is looked at on its own |
 
-PR 10 must not merge before the OID arc is decided.
+PR 11 must not merge before the OID arc is decided.
 
 ### Track E — closing out
 
 | PR | Contents | Size |
 |---|---|---|
-| **13** | Module README: enabling under the OTel and Datadog agents, config reference, the attribute table as user-facing docs, recommended `service.name` / `service.version`, and what the server span duration means | ~250 |
+| **14** | Module README: enabling under the OTel and Datadog agents, config reference, the attribute table as user-facing docs, and recommended `service.name` / `service.version` | ~250 |
 
 ### Merge order and parallelism
 
 ```
-  1 ──► 2 ──► 3 ──┬──► 4 ──► 5 ──► 6 ──┐
-                  │                     ├──► 10 ──┬──► 11 ──┐
-                  └──► 7 ──► 8 ──► 9 ──┘          └──► 12 ──┴──► 13
+  1 ──► 2 ──► 3 ──┬──► 4 ──► 5 ──► 6 ───────┐
+                  │                          ├──► 11 ──┬──► 12 ──┐
+                  └──► 7 ──► 8 ──► 9 ──► 10 ─┘         └──► 13 ──┴──► 14
 ```
 
 Tracks B and C are independent once PR 3 lands and touch disjoint files — B is confined to
-`wrends-telemetry`, C to `opendj-server-legacy` plus packaging.
+`wrends-telemetry`, C to `opendj-server-legacy`.
 
-Thirteen PRs averaging ~300 lines. Defensible consolidations are 1+2+3 and 7+8+9, taking it
-to seven. The splits worth keeping under any consolidation are 4 from 5, and 12 on its own.
+Fourteen PRs averaging ~300 lines. Defensible consolidations are 1+2+3 and 9+10, taking it
+to eleven. The splits worth keeping under any consolidation are 4 from 5, 7 on its own, and
+13 on its own.
 
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
 | A stored `Scope` leaks across the request/response thread boundary | store `Span` + `Context` only; explicit parenting; no long-lived `Scope` |
-| A span held open for a persistent search for hours | detect the persistent-search control and skip tracing |
-| The server span means less than reviewers assume | document it as processing latency, in the README and the config reference |
+| A span held open for a persistent search for hours | detect the persistent-search control at the start call site and skip tracing |
+| Span leaked on a path that never reaches `sendResponse` (abandon, disconnect mid-operation) | end the span wherever the operation leaves `operationsInProgress`; drain in-flight operations on disconnect; a test per path |
+| Hot-path cost on the accept/run/respond call sites when no agent is installed | no allocation or string building before `isRecording()`; a no-agent benchmark merged with PR 8 |
+| The `runOperation` refactor changes queueing behaviour | land it as a standalone behaviour-preserving PR reviewed on work-queue correctness alone |
 | Tracer captured before the SDK installs, producing permanent silence | lazy resolution + injectable `OpenTelemetry`; a test asserting spans arrive after late SDK install |
-| Client and server spans end up siblings | inject the span context, not the caller context; asserted by a test in PR 11 |
+| Client and server spans end up siblings | inject the span context, not the caller context; asserted by a test in PR 12 |
 | Critical-flag mistake breaks operations against non-instrumented servers | `isCritical()` hardcoded `false`, covered by a test |
 | PII leaking through DNs or filters | structural obfuscator that cannot reach values; filters off by default; a test asserting no raw DN appears in any exported span |
 | Unbounded attribute construction from attacker-influenced input | hard limits on DN length, filter depth and control count, with defined truncation |
@@ -608,7 +694,7 @@ to seven. The splits worth keeping under any consolidation are 4 from 5, and 12 
 1. Which OID arc for the trace-context control? Needed before PR 10.
 2. Does a `db.system.name` shim materially improve Datadog classification? Decide in
    phase 5 with evidence; adopt only server-side, configurable, defaulting off.
-3. Should the publisher ship inside the server distribution by default (disabled), or as a
-   separately installed extension?
-4. Is full-handling server latency, past `sendResponse()`, worth an operation-dispatch call
-   site in a follow-up?
+3. Should `ldap.queue_time` also be emitted as a span event marking dequeue, so the wait is
+   visible in a waterfall rather than only as an attribute?
+4. Do internal operations via `InternalClientConnection` warrant their own span kind later,
+   or stay untraced?
