@@ -1,13 +1,13 @@
 # Wren:DS OpenTelemetry Instrumentation — Implementation Plan
 
-Status: proposal · Target: 5.2.0 · Java 17 · Revised 2026-08-19
+Status: proposal · Target: 5.2.0 · Java 17
 
 ## Summary
 
-**One new Maven module, one external compile dependency, no SDK, no Datadog artifact
-anywhere in the tree.** `wrends-telemetry` holds the shared tracing vocabulary and
-lifecycle helpers; instrumentation lives at the natural operation boundaries in the modules
-that own them.
+Add one Maven module, `wrends-telemetry`, holding the shared tracing vocabulary and
+helpers. Instrumentation lives at the natural operation boundaries in the modules that own
+them: a `ConnectionFactory` decorator for the LDAP client, an `AccessLogPublisher` for the
+directory server.
 
 ```
 opendj-core  ──────────────┐
@@ -19,30 +19,27 @@ opendj-core  ──────────────┐
 opendj-server-legacy ──────┘        (instrumentation call sites)
 ```
 
-`opendj-core` is **not modified and does not depend on telemetry.** That is the change
-that collapses an earlier four-artifact design down to one: the LDAP client wrapper lives
-in `wrends-telemetry` rather than inside the SDK, so the SDK's `japicmp`-frozen public API
-is never touched.
+`opendj-core` is not modified and does not depend on telemetry. Keeping the client wrapper
+in `wrends-telemetry` rather than inside the SDK means the SDK's `japicmp`-frozen public
+API is never touched, and the span schema stays free to evolve.
 
-Three settled decisions:
+Three decisions the rest of the plan follows from:
 
-1. **OpenTelemetry API only.** `io.opentelemetry:opentelemetry-api` is the single telemetry
-   dependency. No SDK, no exporter, no autoconfigure, no collector config — the operator
-   supplies the runtime via the OTel or Datadog Java agent. This is OTel's documented
-   guidance for libraries.
-2. **Library instrumentation, not an agent.** Both sides are code we own and ship.
-3. **No vendor abstraction layer.** OTel *is* the abstraction. Zero `datadog.*` imports;
-   Datadog compatibility comes from attribute naming plus the DD agent's OTel API bridge.
+1. **OpenTelemetry API only, in production scope.** `io.opentelemetry:opentelemetry-api` is
+   the single telemetry compile dependency — no exporter, no autoconfigure, no collector
+   config; the operator supplies the runtime via the OTel or Datadog Java agent. Tests use
+   `opentelemetry-sdk` / `opentelemetry-sdk-testing` in `test` scope to assert against an
+   in-memory exporter.
+2. **Library instrumentation, not an agent.** Both sides are code we own and ship, so there
+   is no reason to maintain bytecode advice, muzzle ranges, or a vendor fork.
+3. **No vendor abstraction layer.** OTel is the abstraction. Zero `datadog.*` imports;
+   Datadog compatibility comes from attribute naming plus the Datadog agent's OTel API
+   bridge.
 
 ## Module: `wrends-telemetry`
 
-### Name and coordinates
-
-`wrends-telemetry`, package `org.wrensecurity.wrends.telemetry`. Not `opendj-telemetry` /
-`org.wrensecurity.opendj.telemetry` — new modules take the product name, and the package
-is a clean break from the inherited `org.forgerock.opendj.*` / `org.opends.server.*` trees.
-
-Not `wrends-telemetry-otel` + `-datadog`. That abstraction is exactly what OTel already is.
+Package root `org.wrensecurity.wrends.telemetry`, a clean break from the inherited
+`org.forgerock.opendj.*` / `org.opends.server.*` trees.
 
 ### Dependencies
 
@@ -57,236 +54,199 @@ Not `wrends-telemetry-otel` + `-datadog`. That abstraction is exactly what OTel 
 </dependency>
 ```
 
-The `opendj-core` dependency is load-bearing, not incidental: the vocabulary keys off core
-types on **both** sides of the wire. `Operation.getResultCode()` in the legacy server
-returns `org.forgerock.opendj.ldap.ResultCode` — the core type
-(`types/Operation.java:25,178`). DN obfuscation walks `DN`/`RDN`/`AVA`. The trace-context
-control implements `org.forgerock.opendj.ldap.controls.Control`. One vocabulary, one set
-of types, both sides.
+The `opendj-core` dependency is load-bearing: the legacy server's `Operation` exposes core
+types — `getResultCode()` returns `org.forgerock.opendj.ldap.ResultCode` and
+`getMatchedDN()` returns `org.forgerock.opendj.ldap.DN` (`types/Operation.java:24-25`), as
+does `SearchOperation.getBaseDN()`. Result-code classification and DN obfuscation are
+therefore genuinely shared code across both sides.
 
-Pin the version in the root `dependencyManagement` (already present, `pom.xml:146-249`) as
-a single `opentelemetry-api` entry rather than importing the full OTel BOM — that is the
-only OTel artifact Wren compiles against.
+Controls are the exception. The server's `Operation.getRequestControls()` returns
+`org.opends.server.types.Control`, an *abstract class* unrelated to the SDK's
+`org.forgerock.opendj.ldap.controls.Control` interface, so only a wire codec can be shared
+— see [Trace context propagation](#trace-context-propagation).
 
-### Contents
+Pin the version in the root `dependencyManagement` (`pom.xml:146-249`) as a single
+`opentelemetry-api` entry rather than importing the full OTel BOM, which is the only OTel
+artifact compiled against.
 
-```
-org.wrensecurity.wrends.telemetry
-├── DirectoryTelemetry          entry point; resolves the Tracer, holds config
-├── LdapOperationSpan           AutoCloseable span lifecycle wrapper
-├── TelemetryConnectionFactory  client-side ConnectionFactory decorator
-├── TelemetryConnection         client-side Connection decorator
-├── attribute/
-│   ├── LdapAttributes          AttributeKey constants
-│   ├── LdapSpanNames           span naming
-│   ├── LdapResultCodes         result code -> span status + name
-│   └── LdapControlNames        control OID -> short name
-├── obfuscation/
-│   ├── ObfuscationPolicy       values | full | none
-│   ├── Dns                     DN/RDN obfuscation
-│   └── Filters                 filter shape, client + server adapters
-└── propagation/
-    ├── TraceContextRequestControl   W3C traceparent/tracestate carrier
-    └── TraceContextControls         TextMapSetter / TextMapGetter
-```
+### Package layout
 
-### Treat it as internal, not public API
-
-Do **not** add it to `opendj-bom` initially, and mark the packages internal in Javadoc and
-via OSGi (`Private-Package` where the bundle config allows). The span schema needs freedom
-to change across the first few releases; publishing it as supported API forfeits that.
-
-Note that "internal" here is a stance, not enforcement — as a compile dependency of
-`opendj-server-legacy` the artifact still reaches Maven Central. The BOM omission and the
-Javadoc marker are what signal intent.
-
-## Where instrumentation lives
-
-### Server — `opendj-server-legacy`
-
-The legacy module owns the distribution and knows *when* an LDAP operation begins and ends.
-Start with an `AccessLogPublisher` implementation as the call site for the root span.
-
-That SPI is a better fit than it first appears: it exposes **both** `logXxxRequest(op)` and
-`logXxxResponse(op)` — plus `logSearchRequest`/`logSearchResultDone` and
-`logConnect`/`logDisconnect` — so spans get a genuine start and end rather than a synthetic
-duration. It also brings runtime enable/disable and configuration for free through the
-admin framework, and needs no edits to operation dispatch.
-
-- Start the span in `logXxxRequest`, end it in `logXxxResponse` / `logSearchResultDone`.
-- **Stash the span on the operation**, not in a thread-local:
-  `Operation.setAttachment(String, Object)` / `getAttachment(String)`
-  (`types/Operation.java:491,518`). Request and response hooks are not guaranteed to run on
-  the same thread.
-- Attributes come off `Operation`: `getOperationType()`, `getResultCode()`,
-  `getMessageID()`, `getConnectionID()`, `getMatchedDN()`, `getProcessingTime()`.
-  `SearchOperation` adds `getBaseDN()`, `getScope()`, `getFilter()`, `getEntriesSent()`.
-- Controls: `getRequestControls()` / `getResponseControls()` (`types/Operation.java:116,149`).
-  The server already has a `shouldLogControlOids()` notion in its publishers — align naming.
-- Config plumbing follows `opendj-server-example-plugin`: a `*Configuration.xml`
-  admin-framework definition, `Package.xml`, and a schema LDIF. Budget real time; it is the
-  least familiar part of the work.
-
-**Depth comes later, through explicit call sites.** A publisher-based span is flat — no
-children for backend access, index lookup, or plugin execution. When that breakdown is
-needed, add `DirectoryTelemetry.startBackendOperation(...)` call sites in the backend code
-to produce `ldap.search → backend.search → backend.index`. Deliberately deferred: start
-with meaningful logical operations, not a span per internal method.
-
-### Client — no in-tree call sites
-
-The client wrapper *is* the instrumentation. `TelemetryConnectionFactory` decorates any
-`ConnectionFactory`; the application wraps its **outermost** factory:
+Application code instantiates the client wrapper, which makes it an API contract whether or
+not it appears in a BOM. Keep that contract explicit and small; everything else stays free
+to change.
 
 ```
-TelemetryConnectionFactory          <- one CLIENT span per logical operation
-  └── CachedConnectionPool          <- wrap separately for "LDAP pool acquire"
-        └── RequestLoadBalancer
-              └── LDAPConnectionFactory   <- wrap separately for "LDAP connect"
-                    └── GrizzlyLDAPConnection
+org.wrensecurity.wrends.telemetry            <- experimental public API
+├── TelemetryConnectionFactory
+├── TelemetryOptions                          Option<...> constants
+└── DirectoryTelemetry                        entry point
+
+org.wrensecurity.wrends.telemetry.internal   <- no compatibility promise
+├── LdapOperationTrace
+├── LdapAttributes                            AttributeKey constants
+├── LdapSpanNames
+├── LdapResultCodes                           result code -> status + text
+├── obfuscation/{ObfuscationPolicy, Dns, Filters}
+└── propagation/{TraceContextCodec, TraceContextRequestControl}
 ```
 
-Because placement is explicit, the decorator chain never double-counts and no span
-suppression logic is needed.
+Mark the public package experimental in Javadoc, keep `.internal` out of the OSGi
+`Export-Package` list, and leave the module out of `opendj-bom` until the schema settles.
 
-### `opendj-server` — nothing to instrument
+## Span model
 
-Do not add the telemetry dependency here. `opendj-server` ("Wren:DS Server NG") is a
-**21-file skeleton** of interfaces — `DataProvider`, `Operation`, `AttachmentHolder`,
-`DataProviderConnection` — with no operation dispatch to hook. It is also *upstream* of the
-legacy module: `opendj-server-legacy` depends on `opendj-server` (`opendj-server-legacy/pom.xml:161`),
-not the other way round. Revisit only if Server NG grows real request handling.
+### What a server span measures
 
-## The shared API
+`AccessLogPublisher` provides request and response hooks without touching operation
+dispatch, but the response hook is not the end of server handling. In
+`SearchOperationBasis:774-784` the order is:
 
-Centralize span mechanics so implementation code carries none of it, and so one file
-defines Wren's tracing contract — naming, safe attributes, error handling, PII rules.
-
-```java
-try (LdapOperationSpan span = DirectoryTelemetry.startLdapOperation(operation)) {
-    processSearch();
-    span.setResultCode(resultCode);
-} catch (Throwable t) {
-    span.recordException(t);   // see below — close() cannot see this
-    throw t;
-}
+```
+responseSent.compareAndSet(false, true)
+    logSearchResultDone(this)        <- publisher hook fires here
+    clientConnection.sendResponse(this)
+    invokePostResponsePlugins()
 ```
 
-### Two corrections to the obvious implementation
+A publisher-based span therefore measures **LDAP operation processing latency** — request
+accepted through result prepared — excluding response transmission and post-response
+plugins. That is a useful measurement, and it must be named as such in the configuration
+reference and the README; it is not full server request/response latency.
 
-**1. `close()` cannot see the throwable.** A bare try-with-resources silently loses error
-status: if `processSearch()` throws, `setResultCode` never runs and `close()` has no way to
-know the block failed, so the span ends with `StatusCode.UNSET` and no exception recorded.
-Either require the `catch` above at every call site, or — better — give the helper an
-explicit failure path and make the contract impossible to get wrong:
+Producing a conventional `SERVER` span covering complete handling requires an explicit call
+site after `sendResponse()`, not a different publisher hook. That is deferred.
 
-```java
-final class LdapOperationSpan implements AutoCloseable {
-    private final Span span;
-    private final Scope scope;
-    private boolean completed;
+### Persistent searches are not traced
 
-    void setResultCode(ResultCode rc) {
-        completed = true;
-        span.setAttribute(LdapAttributes.RESULT_CODE, rc.intValue());
-        span.setAttribute(LdapAttributes.RESULT_CODE_NAME, rc.getName());
-        if (LdapResultCodes.isError(rc)) {
-            span.setStatus(StatusCode.ERROR);
-        }
-    }
+The same code path warns that it "could be multithreaded in the event of a persistent
+search" (`SearchOperationBasis:777`). For a persistent search, `logSearchResultDone` fires
+only when the search finally terminates — potentially hours later. A span held open that
+long is worse than no span: it is invisible to the backend until it ends, and it distorts
+every latency aggregate it lands in.
 
-    void recordException(Throwable t) {
-        completed = true;
-        span.recordException(t);
-        span.setStatus(StatusCode.ERROR);
-    }
+Detect the persistent-search request control and skip tracing the operation. Streaming-phase
+observability belongs in metrics or span events, which is a separate decision.
 
-    @Override
-    public void close() {          // idempotent
-        if (!completed) {
-            span.setStatus(StatusCode.ERROR, "operation ended without a result");
-        }
-        scope.close();             // scope before span, always
-        span.end();
-    }
-}
-```
+### Span kinds and names
 
-**2. Do not capture the Tracer in a `static final` field.** A tracer resolved at class-init
-time can be obtained from `GlobalOpenTelemetry` before the agent or SDK has installed
-itself, and the instrumentation then emits nothing for the process lifetime — a failure
-mode that produces no error, just silence. Resolve lazily on first use, and accept an
-injected `OpenTelemetry` instance for tests and embedded use:
+Span names must be low cardinality. An obfuscated DN is far safer than a raw one but is not
+inherently low-cardinality — LDAP trees have arbitrary depth and arbitrary RDN attribute
+types (`uid=?,ou=?,dc=?,dc=?`, `service=?,region=?,tenant=?,dc=?,dc=?`, …). The DN shape is
+an attribute, not part of the span name.
 
-```java
-public final class DirectoryTelemetry {
-    private static volatile DirectoryTelemetry instance;
+| Span name | Kind | Where |
+|---|---|---|
+| `ldap.search`, `ldap.bind`, `ldap.add`, `ldap.modify`, `ldap.modifyDN`, `ldap.delete`, `ldap.compare`, `ldap.extended` | `CLIENT` | one per logical client operation |
+| same names | `SERVER` | one per server-side operation |
+| `ldap.connect` | `CLIENT` | real TCP connect + TLS + initial bind |
+| `ldap.pool.acquire` | `INTERNAL` | pool wait time, never conflated with connect |
+| `backend.*` | `INTERNAL` | deferred; explicit call sites in backend code |
 
-    public static DirectoryTelemetry get() { ... }              // lazy global
-    public static DirectoryTelemetry using(OpenTelemetry otel) { ... }  // injected
-}
-```
-
-The injected form is not optional extra credit — it is how the tests assert against an
-in-memory exporter without touching global state.
-
-Advanced code may still reach for `Span.current()` where it genuinely needs to, but that
-should not become the normal pattern.
+Consequence to accept knowingly: OTel span names map to Datadog resource names, so Datadog
+resources are coarse (`ldap.search` rather than `search ou=?,dc=?`). Facet on
+`ldap.request.dn` instead. Correct cardinality is worth more than a pre-grouped resource.
 
 ## Semantic conventions
 
-**Settle this before any code.** There is no OpenTelemetry semantic convention for LDAP.
-Model on the database conventions where they fit; add an `ldap.*` namespace for what they
-do not. This is the contract `LdapAttributes` encodes — if client and server disagree on
-it, correlation is dead on arrival.
+Settle this table before PR 1. There is no OpenTelemetry semantic convention for LDAP, so
+use the stable generic attributes where they apply and an `ldap.*` namespace for the rest.
+Client and server must agree on it exactly, or cross-side correlation is worthless.
 
 | Attribute | Example | Side | Notes |
 |---|---|---|---|
-| `db.system.name` | `ldap` | both | drives vendor span-type mapping |
-| `ldap.operation` | `search` | both | lowercase, normalized across both codebases |
-| `ldap.dn` | `uid=?,ou=?,dc=?,dc=?` | both | values always obfuscated |
-| `ldap.result_code` | `32` | both | numeric |
-| `ldap.result_code.name` | `noSuchObject` | both | |
-| `ldap.matched_dn` | `ou=?,dc=?` | both | on failure only |
-| `ldap.message_id` | `7` | both | correlation key |
-| `ldap.connection_id` | `114` | both | correlation key |
-| `ldap.request.controls` | `paged-results,proxied-auth-v2` | both | sorted, comma-joined short names |
-| `ldap.response.controls` | `password-policy` | both | |
-| `ldap.search.scope` | `wholeSubtree` | both | |
-| `ldap.search.filter` | `(&(objectClass=?)(uid=?))` | both | **off by default**, shape only |
-| `ldap.search.entries_returned` | `1` | both | |
-| `ldap.search.page_size` | `500` | both | `SimplePagedResultsControl.getSize()` |
-| `ldap.response.password_policy.error` | `passwordExpired` | both | high-signal, non-PII |
+| `network.protocol.name` | `ldap` | both | stable generic attribute for the app-layer protocol |
+| `network.protocol.version` | `3` | both | |
+| `network.transport` | `tcp` | client | |
 | `server.address` / `server.port` | `ds01.example.com` / `1636` | client | |
+| `ldap.operation.name` | `search` | both | follows the `db.operation.name` shape |
+| `ldap.request.dn` | `uid=?,ou=?,dc=?,dc=?` | both | values always obfuscated |
+| `ldap.request.control_oids` | `["1.2.840.113556.1.4.319"]` | both | string array |
+| `ldap.response.status_code` | `32` | both | numeric, follows `http.response.status_code` |
+| `ldap.response.status_text` | `noSuchObject` | both | |
+| `ldap.response.matched_dn` | `ou=?,dc=?` | both | on failure only |
+| `ldap.response.control_oids` | `["2.16.840.1.113730.3.4.4"]` | both | string array |
+| `ldap.search.scope` | `wholeSubtree` | both | |
+| `ldap.search.filter` | `(&(objectClass=?)(uid=?))` | both | off by default, shape only |
+| `ldap.search.entries_returned` | `1` | both | |
+| `ldap.search.page_size` | `500` | both | from the paged-results control |
+| `ldap.response.password_policy.error` | `passwordExpired` | both | high-signal, non-PII |
 | `ldap.tls.enabled` / `ldap.tls.starttls` | `true` | client | |
-| `error.type` | `LdapException` | both | on failure |
+| `error.type` | `invalidCredentials` / `LdapException` | both | see below |
+| `ldap.connection_id` / `ldap.message_id` | `114` / `7` | both | opt-in, local diagnostics only |
 
-### Span shapes
+### Product identity goes in `service.name`, not `db.system.name`
 
-| Span | Kind | Where |
-|---|---|---|
-| `{operation} {ldap.dn}` | `CLIENT` | one per logical client operation |
-| `LDAP connect` | `CLIENT` | real TCP connect + TLS + initial bind |
-| `LDAP pool acquire` | `INTERNAL` | pool wait time — never conflated with connect |
-| `{operation} {ldap.dn}` | `SERVER` | one per server-side operation |
-| `backend.*` | `INTERNAL` | deferred; explicit call sites in backend code |
+`db.system.name` is not set, for two independent reasons.
 
-Span names use the **obfuscated** DN, which is what keeps them low-cardinality — the same
-mechanism that makes `GET /users/?` a usable resource name. Connections are long-lived and
-are modelled as attributes, never as spans.
+**LDAP is not a DBMS product.** The stable OTel database conventions describe a *database
+client call* with `SpanKind.CLIENT`, which does not cover the server span at all.
+
+**The attribute names the server product, not the client's vendor.** The definition — "the
+DBMS product as identified by the client instrumentation" — qualifies *who* names it
+(client-side code, with imperfect knowledge), not *what* is named. The spec's own example
+settles it: a PostgreSQL client library connected to CockroachDB sets `postgresql`, not
+`cockroachdb`. The value tracks the protocol/product family the client speaks, deliberately
+not the actual server vendor.
+
+So a Wren:DS-specific value fails on both sides. On client spans, the SDK connects to
+OpenLDAP, Active Directory, 389-DS, or Wren:DS and cannot know which — claiming the product
+asserts something the instrumentation has no way to establish. Across sides, if the server
+declared one value and the client another, the two spans of a single operation would
+disagree on the attribute whose purpose is to group them. That leaves the protocol family
+as the only honest value, which the first reason rules out.
+
+Product identity belongs in the OTel *resource* attributes on the server process:
+
+```
+service.name    = directory-prod    (the deployment's service name)
+service.version = 5.2.0             (the Wren:DS version)
+```
+
+These are set once per process by agent or SDK configuration, cost nothing per operation,
+and are what every backend including Datadog already keys service identity off. Document
+recommended values in the README rather than emitting them from instrumentation code. Note
+that `service.name` conventionally names the *deployment*, not the product — a shop running
+three directories wants `directory-prod` / `directory-staging`, not three services all
+called `wrends`.
+
+If a span-level product attribute is wanted later — to distinguish directory vendors in a
+mixed estate from the client side, once the server advertises itself — add
+`ldap.server.product` in the `ldap.*` namespace rather than overloading a registry-governed
+attribute.
+
+If Datadog classification argues for `db.system.name` after phase 5 verification, add it as
+a server-only configurable shim defaulting off, documented as a vendor compatibility
+measure, never on client spans.
+
+### `error.type` depends on how the operation failed
+
+Two distinct failure modes, two low-cardinality values:
+
+- **Protocol failure** — the request reached the server and returned a failing result code:
+  `error.type` = the result-code name (`invalidCredentials`, `noSuchObject`).
+- **Transport or runtime failure** — no result code exists: `error.type` = the exception
+  class simple name (`LdapException`, `ConnectException`).
 
 ### Error classification
 
-Do not port "non-zero result code is an error" from the HTTP conventions; it floods
-dashboards with false errors. Default the error set to every result code **except**
-`{0 success, 5 compareFalse, 6 compareTrue, 10 referral, 14 saslBindInProgress}`, and make
-it configurable. `compareFalse` is a successful compare; `noSuchObject` and
-`invalidCredentials` are routine outcomes on an authentication path. Always set
-`ldap.result_code` regardless, so teams can build their own monitors on top.
+"Non-zero result code is an error" would flood dashboards with false errors. Default the
+error set to every result code except `{0 success, 5 compareFalse, 6 compareTrue,
+10 referral, 14 saslBindInProgress}`, configurable. `compareFalse` is a successful compare;
+`noSuchObject` and `invalidCredentials` are routine on an authentication path. Always set
+`ldap.response.status_code` regardless, so teams can build their own monitors.
+
+### Controls
+
+Emit raw OIDs in a string array. That is lossless, needs no lookup table, and survives
+controls we have never heard of; dashboards can map OIDs to labels at display time.
+
+Never emit control values. `ProxiedAuthV2RequestControl`'s value *is* an authzid — a full
+DN — and the paged-results cookie is opaque server state. Decode only
+`ldap.search.page_size` and `ldap.response.password_policy.error`.
 
 ### Obfuscation
 
-DN obfuscation is an allowlist, not a scrub — walk the structure and emit attribute *types*
+DN obfuscation is an allowlist, not a scrub — walk the structure and emit attribute types
 only, never touching values:
 
 ```java
@@ -299,105 +259,228 @@ for (RDN rdn : dn) {
 }
 ```
 
-`uid=bjensen,ou=people,dc=example,dc=com` → `uid=?,ou=?,dc=?,dc=?`. Because it cannot reach
-a value, it cannot leak one. Modes: `values` (default), `full` (drop attribute types too),
-`none` (raw, lab use only).
+`uid=bjensen,ou=people,dc=example,dc=com` → `uid=?,ou=?,dc=?,dc=?`. Because the code cannot
+reach a value, it cannot leak one. Modes: `values` (default), `full` (drop attribute types
+too), `none` (raw, lab use only).
 
-**The filter obfuscator needs two adapters.** The client sees
-`org.forgerock.opendj.ldap.Filter`; the server sees `org.opends.server.types.SearchFilter`.
-Unrelated types. Define the shape algorithm once against a small internal interface.
+Enforce hard limits, all configurable with documented defaults: maximum obfuscated DN
+length, maximum filter nesting depth, maximum number of control OIDs recorded, and defined
+truncation behaviour (truncate with a trailing marker; never drop the attribute silently).
+LDAP inputs are attacker-influenced, so unbounded attribute construction is a DoS surface.
 
-**Never emit control values.** `ProxiedAuthV2RequestControl`'s value *is* an authzid — a
-full DN. `SimplePagedResultsControl.getCookie()` is opaque server state. Decode only the
-two special-cased fields in the table above. Hardcode the OID→name lookup rather than
-referencing the ~30 SDK control classes.
+Guard every expensive computation so sampled-out spans pay nothing:
 
-## Client implementation notes
+```java
+if (span.isRecording()) {
+    span.setAttribute(LdapAttributes.REQUEST_DN, Dns.obfuscate(dn));
+}
+```
 
-### The trap: do not extend `AbstractConnectionWrapper`
+The filter obfuscator needs two adapters: the client sees
+`org.forgerock.opendj.ldap.Filter`, the server sees `org.opends.server.types.SearchFilter`,
+and they are unrelated types. Define the shape algorithm once against a small internal
+interface.
+
+## Context lifecycle
+
+A `Scope` mutates `Context.current()` on one thread until closed, so it cannot span a
+request hook and a response hook that may run on different threads — which the server does
+for persistent searches. Attach a span plus its context and hold no long-lived `Scope`:
+
+```java
+public final class LdapOperationTrace {
+    private final Span span;
+    private final Context context;
+    private final AtomicBoolean ended = new AtomicBoolean();
+
+    static LdapOperationTrace start(Tracer tracer, String name, Context parent) {
+        Span span = tracer.spanBuilder(name)
+                          .setParent(parent)
+                          .setSpanKind(SpanKind.SERVER)
+                          .startSpan();
+        return new LdapOperationTrace(span, parent.with(span));
+    }
+
+    public Context context() { return context; }   // explicit propagation for children
+
+    public void complete(ResultCode rc) { ... }    // sets status attributes, ends span
+    public void fail(Throwable t) { ... }          // records exception, ends span
+}
+```
+
+- Store the trace on the operation via `Operation.setAttachment(String, Object)`
+  (`types/Operation.java:518`).
+- Child spans use explicit parenting: `.setParent(trace.context())`. Never rely on
+  `Span.current()` crossing a hook boundary.
+- `complete` and `fail` are idempotent, guarded by the `ended` flag.
+
+Where automatic log correlation and implicit child parenting are wanted during synchronous
+processing, activate the context in a narrow lexical block on the executing thread:
+
+```java
+try (Scope scope = trace.context().makeCurrent()) {
+    // synchronous processing only
+}
+```
+
+That is a separate concern from span lifetime, and it likely justifies one small
+operation-dispatch call site rather than making the access-log publisher own a thread-local.
+
+The client path does not use this shape: it starts the span in the `*Async` method and
+completes it from the promise callback.
+
+## Client instrumentation
+
+`TelemetryConnectionFactory` decorates any `ConnectionFactory`; the application wraps its
+outermost factory:
+
+```
+TelemetryConnectionFactory          <- one CLIENT span per logical operation
+  └── CachedConnectionPool          <- wrap separately for "ldap.pool.acquire"
+        └── RequestLoadBalancer
+              └── LDAPConnectionFactory   <- wrap separately for "ldap.connect"
+                    └── GrizzlyLDAPConnection
+```
+
+Because placement is explicit, the decorator chain never double-counts and no span
+suppression logic is needed.
+
+### Extend `AbstractAsynchronousConnection`, not `AbstractConnectionWrapper`
 
 `AbstractConnectionWrapper.add(request)` delegates straight to `connection.add(request)`
-(`AbstractConnectionWrapper.java:82-84`) — it does **not** route synchronous calls through
-the async methods. Overriding only `*Async` on a wrapper would silently miss every blocking
-call in the application.
+(`AbstractConnectionWrapper.java:82-84`) — it does not route synchronous calls through the
+async methods, so overriding only `*Async` on that base class silently misses every
+blocking call in the application.
 
-Extend **`AbstractAsynchronousConnection`** instead and hold the delegate as a field. Its
-synchronous methods are all `blockingGetOrThrow(xxxAsync(request))`
-(`AbstractAsynchronousConnection.java:45-83`), so instrumenting the nine `*Async` methods
-covers the blocking API for free. Cost: hand-implementing ~10 non-operation methods
-(`close`, `isValid`, listener registration, …). The convenience overloads on
-`AbstractConnection` come along correctly.
+`AbstractAsynchronousConnection` implements every synchronous method as
+`blockingGetOrThrow(xxxAsync(request))` (`AbstractAsynchronousConnection.java:45-83`).
+Extending it and holding the delegate as a field means instrumenting the nine `*Async`
+methods covers the blocking API for free, at the cost of hand-implementing about ten
+non-operation methods (`close`, `isValid`, listener registration, …). The convenience
+overloads on `AbstractConnection` come along correctly.
 
 The same applies to `LDAPConnectionFactory.getConnection()`, which is
 `getConnectionAsync().getOrThrowUninterruptibly()` (`LDAPConnectionFactory.java:440`).
 
 ### Span lifecycle
 
-Start the span in the `*Async` method, end it from
+Start the span in the `*Async` method and complete it from
 `LdapPromise#thenOnResultOrException(ResultHandler, ExceptionHandler)`
-(`LdapPromise.java:54`). No context store needed.
+(`LdapPromise.java:54`). No context store is needed.
 
-**That callback fires on a Grizzly worker thread.** End the span there; do not activate a
-`Scope` you will not close. Capture the caller's `Context` at request time and use it as
-parent explicitly rather than relying on thread-locals. Note that `LdapOperationSpan`'s
-try-with-resources pattern does **not** fit the async client path — it is for the
-synchronous server side. The client uses the promise callback directly.
+That callback fires on a Grizzly worker thread. End the span there and never activate a
+`Scope` that will not be closed; capture the caller's `Context` at request time and pass it
+as an explicit parent.
 
 Search entry counts come from wrapping the `SearchResultHandler` argument.
 
-Configuration is exposed as `Option<...>` constants, consistent with the SDK's existing
-style: enable/disable, DN obfuscation mode, filter capture (default off), error result-code
-set, propagation on/off.
+Configuration is exposed as `Option<...>` constants in `TelemetryOptions`, consistent with
+the SDK's existing style: enable/disable, DN obfuscation mode, filter capture, error
+result-code set, propagation, and the obfuscation limits.
+
+## Server instrumentation
+
+Implement `AccessLogPublisher<OpenTelemetryAccessLogPublisherCfg>` in
+`opendj-server-legacy`.
+
+- Start the span in `logXxxRequest`, complete it in `logXxxResponse` /
+  `logSearchResultDone`.
+- Attributes come off `Operation`: `getOperationType()`, `getResultCode()`,
+  `getMessageID()`, `getConnectionID()`, `getMatchedDN()`, `getProcessingTime()`.
+  `SearchOperation` adds `getBaseDN()`, `getScope()`, `getFilter()`, `getEntriesSent()`.
+- Controls come from `getRequestControls()` / `getResponseControls()`
+  (`types/Operation.java:116,149`). The server already has a `shouldLogControlOids()` notion
+  in its publishers; align the configuration naming with it.
+- Config plumbing follows `opendj-server-example-plugin`: a `*Configuration.xml`
+  admin-framework definition, `Package.xml`, and a schema LDIF. This is the least familiar
+  part of the work and deserves explicit budget.
+
+Using the publisher SPI means runtime enable/disable and configuration come for free
+through the admin framework, and operation dispatch is untouched.
 
 ## Trace context propagation
 
-The client injects `TraceContextRequestControl` via the configured `TextMapPropagator`; the
-server extracts it in `logXxxRequest` and uses it as the parent context. Opt-in on both
-ends, default off.
+### Share the codec, not the control
 
-- **`isCritical()` must return `false`.** A critical unknown control makes any
-  non-instrumented server reject the operation with `unavailableCriticalExtension` (12) —
-  every directory that has not been upgraded. Cover it with a test.
-- Needs a private OID under a Wren Security arc. **Reserve it before implementation
-  starts** — it is painful to change after release.
-- **The server side is a trust boundary.** Accepting trace context from arbitrary clients
-  lets anyone forge parentage or inject unbounded trace IDs. Gate it on an allowlist by
-  authenticated identity or client address, and document it as such. The server must not
-  echo the control back in the response.
+`org.opends.server.types.Control` is an abstract class with its own `getOID()` /
+`getValue()`; the SDK's `org.forgerock.opendj.ldap.controls.Control` is an unrelated
+interface. One class cannot satisfy both, and `wrends-telemetry` must not depend back on
+`opendj-server-legacy`. So `TraceContextCodec` holds the wire format,
+`TraceContextRequestControl` implements the SDK interface for the client, and the server
+publisher decodes directly:
 
-Until this ships, `ldap.connection_id` + `ldap.message_id` are emitted by both sides from
-day one and give a manual join key in any backend, at zero protocol cost.
+```java
+for (org.opends.server.types.Control c : operation.getRequestControls()) {
+    if (TraceContextCodec.OID.equals(c.getOID())) {
+        Context parent = TraceContextCodec.decode(c.getValue(), propagator);
+    }
+}
+```
+
+### Inject the span context
+
+```java
+Span clientSpan = tracer.spanBuilder("ldap.search").setSpanKind(CLIENT).startSpan();
+Context toInject = parent.with(clientSpan);
+propagator.inject(toInject, controlCarrier, setter);   // not `parent`
+```
+
+Injecting the caller context would make the server span a sibling of the client span rather
+than its child. Create the span first, then inject.
+
+### Rules
+
+- `isCritical()` must return `false`. A critical unknown control makes any non-instrumented
+  server reject the operation with `unavailableCriticalExtension` (12). Cover it with a
+  test.
+- The control needs a private OID under a Wren Security arc, reserved before PR 10.
+- The server side is a trust boundary. Accepting trace context from arbitrary clients lets
+  anyone forge parentage or inject unbounded trace IDs, so gate it on an allowlist by
+  authenticated identity or client address. The server must not echo the control back.
+- Opt-in on both ends, default off.
+
+### `connection_id` and `message_id` are local diagnostics
+
+```
+client message ID    == server message ID     ✓  (RFC 4511 echoes the request ID)
+client connection ID == server connection ID  ✗  server-assigned, unrelated namespace
+```
+
+Message IDs are only unique within an LDAP session, so across a connection pool they
+collide freely. These attributes are useful for correlating a span with access-log lines on
+one side, but they do not correlate client and server traces — the trace-context control is
+the only thing that does. They are also high cardinality, so they are opt-in and off by
+default.
 
 ## Datadog verification
 
-Two supported paths, neither adding a Datadog dependency to this repo:
+Two supported paths, neither adding a Datadog dependency:
 
-1. **OTLP** to the Datadog agent's OTLP ingest endpoint. `db.system.name`, `span.kind`,
-   `server.address`/`server.port` and `service.name` drive Datadog's mapping to span type,
-   service and peer.
-2. **The Datadog agent's OpenTelemetry API bridge** (`dd.trace.otel.enabled`) — spans
+1. **OTLP** to the Datadog agent's OTLP ingest endpoint.
+2. **The Datadog agent's OpenTelemetry API bridge** (`dd.trace.otel.enabled`), where spans
    created through the OTel API are adopted by `dd-trace-java` natively. Verify the flag
    name against the agent version in use.
 
-The same source also runs unmodified under the OTel Java agent, which explicitly supports
-applications making plain OTel API calls.
+The same source runs unmodified under the OTel Java agent.
+
+Decide the `db.system.name` shim here, with evidence: enable it server-side, compare
+Datadog's classification with and without, and either adopt it as a documented server-only
+configurable shim or drop it. Confirm that `service.name` / `service.version` carry product
+identity end to end.
 
 **Acceptance:** a client operation and its server operation appear as one distributed trace
-with correct parentage, correct service names, correct error flagging on a failed bind, and
-no PII in any tag or span name.
+with correct parentage (child, not sibling), correct service names, correct error flagging
+on a failed bind, and no PII in any attribute or span name.
 
 ## Build tasks
 
 - Add `wrends-telemetry` to the reactor `<modules>` in `pom.xml`, after `opendj-core`.
-  (Maven derives order from dependencies, but listing a foundational module before its
-  consumers keeps the POM readable.)
 - Add a single `io.opentelemetry:opentelemetry-api` entry to the root
-  `dependencyManagement` (`pom.xml:146-249`) with an `${opentelemetry.version}` property.
-  Do not import the full OTel BOM.
+  `dependencyManagement` (`pom.xml:146-249`) with an `${opentelemetry.version}` property,
+  plus `opentelemetry-sdk-testing` in `test` scope. Do not import the full OTel BOM.
 - Add the `wrends-telemetry` dependency to `opendj-server-legacy` only.
-- Configure `maven-bundle-plugin` for the new module, following `opendj-core`'s
-  instructions block.
-- No `japicmp` baseline (no prior release); no `opendj-bom` entry while it is internal.
+- Configure `maven-bundle-plugin`: export the public package, keep `.internal` private.
+- No `japicmp` baseline for the new module; no `opendj-bom` entry while the schema settles.
 - Wire the publisher into the server distribution via `opendj-packages`.
 - Third-party license entry (`src/license/THIRD-PARTY.properties`) for `opentelemetry-api`.
 
@@ -405,87 +488,90 @@ no PII in any tag or span name.
 
 | Phase | Work | Effort |
 |---|---|---|
-| 0 | Semantic conventions — settle the table above | 1 day |
-| 1 | `wrends-telemetry` skeleton: vocabulary, `DirectoryTelemetry`, `LdapOperationSpan`, obfuscation | 3 days |
+| 0 | Semantic conventions and context lifecycle — settle the sections above | 1 day |
+| 1 | Module skeleton: vocabulary, `DirectoryTelemetry`, `LdapOperationTrace`, obfuscation | 3 days |
 | 2 | Client: `TelemetryConnectionFactory` / `TelemetryConnection` + tests | 1 week |
 | 3 | Server: `AccessLogPublisher` + admin config + tests | 1 week |
-| 4 | Propagation control, both directions | 3 days |
-| 5 | Datadog + OTel agent verification | 2 days |
+| 4 | Propagation: codec, client injection, server extraction | 3 days |
+| 5 | Datadog and OTel agent verification | 2 days |
 
-Roughly **3.5–4 weeks** for one engineer; phases 2 and 3 parallelize across two once
-phase 1 lands.
+Roughly 3.5–4 weeks for one engineer; phases 2 and 3 parallelize across two once phase 1
+lands.
 
-**Do the client before the server.** It validates the phase 0 vocabulary against a real
+Do the client before the server. It validates the phase 0 vocabulary against a real
 consumer, and it is the side that cannot be fixed later by editing application code.
 
-Deferred beyond this plan: `backend.*` child spans, metrics, and any instrumentation of
-`opendj-server`.
+Deferred: `backend.*` child spans, full-handling server spans via a post-`sendResponse()`
+call site, persistent-search observability, metrics, and any instrumentation of
+`opendj-server` — a 21-file interface skeleton with no operation dispatch, and upstream of
+the legacy module (`opendj-server-legacy/pom.xml:161`).
 
 ## Pull request breakdown
 
-Two rules make every PR below independently mergeable:
+Two rules make every PR independently mergeable:
 
 1. **Every PR leaves the build green.** No PR depends on a later one to compile or pass.
 2. **Nothing emits a span until an operator configures it.** The module is inert on the
-   classpath; the client wrapper is opt-in by construction (the application chooses to
-   wrap); the server publisher is disabled until an admin config entry exists. There is no
-   big-bang merge and no flag-flip PR — the default stays off through the whole sequence.
+   classpath, the client wrapper is opt-in by construction, and the server publisher is
+   disabled until an admin config entry exists. There is no big-bang merge and no flag-flip
+   PR.
 
-Consequence: PRs 1–11 can all land on `main` without changing the behaviour of a running
+All thirteen PRs can therefore land on `main` without changing the behaviour of a running
 directory. The first behaviour change happens when someone edits their config.
+
+Review the span schema and context lifecycle against this document before PR 1 opens — they
+are the expensive things to change once dashboards and monitors exist.
 
 ### Track A — the module (no consumers, zero runtime impact)
 
 | PR | Contents | Size | Review focus |
 |---|---|---|---|
-| **1** | `wrends-telemetry` module: pom, reactor entry, `${opentelemetry.version}` + root `dependencyManagement`, bundle plugin, `THIRD-PARTY.properties`. Plus the vocabulary: `LdapAttributes`, `LdapSpanNames`, `LdapResultCodes`, `LdapControlNames` | ~400 | **The span schema.** This is the only decision here that is expensive to reverse — review it against the plan doc, not the code |
-| **2** | `ObfuscationPolicy`, `Dns`, `Filters` (client adapter) | ~300 | The PII boundary. Must include a test asserting the obfuscator never calls `AVA.getAttributeValue()` |
-| **3** | `DirectoryTelemetry`, `LdapOperationSpan` | ~250 | Lazy tracer resolution, injectable `OpenTelemetry`, the `completed` flag; tests against an in-memory exporter |
+| **1** | Module: pom, reactor entry, `${opentelemetry.version}`, bundle plugin, license. Vocabulary: `LdapAttributes`, `LdapSpanNames`, `LdapResultCodes` | ~350 | The span schema, reviewed against this document rather than the code |
+| **2** | `ObfuscationPolicy`, `Dns`, `Filters` (client adapter), limits and truncation | ~350 | The PII boundary. Include a test asserting the obfuscator never calls `AVA.getAttributeValue()`, and a test per limit |
+| **3** | `DirectoryTelemetry`, `LdapOperationTrace` | ~250 | Lazy tracer resolution, injectable `OpenTelemetry`, idempotent `complete`/`fail`, no stored `Scope` |
 
-PRs 1–3 can be squashed into one ~1000-line "the telemetry module" PR if the team prefers
-fewer. Splitting buys focused review on the two risky parts — 2 is where PII leaks, 3 is
-where the silent-failure modes live — and both get lost inside a large constants-heavy diff.
+These three are squashable into one ~950-line module PR. Splitting buys focused review on
+the two risky parts — 2 is where PII leaks, 3 is where lifecycle bugs live — which get lost
+inside a large constants-heavy diff.
 
 ### Track B — client (depends on PR 3)
 
 | PR | Contents | Size | Review focus |
 |---|---|---|---|
-| **4** | `TelemetryConnection` extending `AbstractAsynchronousConnection` + `TelemetryConnectionFactory`, **delegation only, no spans**. Test exercising every `Connection` method through the wrapper | ~500 | Delegation completeness. This is where the `AbstractConnectionWrapper` trap lives — isolating it means "does it delegate everything?" is answered before "are the spans right?" |
-| **5** | Span creation, attributes, completion via `thenOnResultOrException`, `SearchResultHandler` wrapping, `Option` config | ~400 | Async lifecycle; the Grizzly-thread completion path |
-| **6** | `LDAP connect` and `LDAP pool acquire` spans (wrapping `LDAPConnectionFactory` / `CachedConnectionPool`) | ~200 | That the two are never conflated |
+| **4** | `TelemetryConnection` extending `AbstractAsynchronousConnection` + factory, delegation only, no spans. Test exercising every `Connection` method through the wrapper | ~500 | Delegation completeness, answered before span logic exists to distract |
+| **5** | Span creation, attributes, completion via `thenOnResultOrException`, `SearchResultHandler` wrapping, `TelemetryOptions` | ~400 | Async lifecycle, the Grizzly-thread completion path, `isRecording()` guards |
+| **6** | `ldap.connect` and `ldap.pool.acquire` spans | ~200 | That the two are never conflated |
 
-Splitting 4 from 5 is the highest-value split in the whole sequence. A wrapper that misses
-a delegation is a correctness bug in the *application*, not just missing telemetry, and it
+Splitting 4 from 5 is the highest-value split in the sequence. A wrapper that misses a
+delegation is a correctness bug in the *application*, not merely missing telemetry, and it
 is invisible in a diff that also introduces span logic.
 
 ### Track C — server (depends on PR 3; parallel with Track B)
 
 | PR | Contents | Size | Review focus |
 |---|---|---|---|
-| **7** | `OpenTelemetryAccessLogPublisher` + `*Configuration.xml`, `Package.xml`, schema LDIF — registers and configures, **emits nothing** | ~400 | Admin-framework plumbing. Route to a reviewer who knows that framework; they should not have to read span logic |
-| **8** | Span start/end in the log hooks, `Operation.setAttachment` carry, attributes, server-side `Filters` adapter | ~400 | Request/response hook pairing and the thread-handoff assumption |
+| **7** | `OpenTelemetryAccessLogPublisher` + `*Configuration.xml`, `Package.xml`, schema LDIF — registers and configures, emits nothing | ~400 | Admin-framework plumbing; route to a reviewer who knows that framework |
+| **8** | Span start/complete in the log hooks, `setAttachment` carry, attributes, server-side `Filters` adapter, persistent-search exclusion | ~450 | Hook pairing, the thread-handoff assumption, and that the span is documented as processing latency |
 | **9** | `opendj-packages` wiring into the server distribution | ~50 | Packaging only |
 
-PR 7 landing empty is deliberate. The config plumbing is the least familiar part of the
-work, and a reviewer who knows the admin framework should be able to approve it without
-forming an opinion on tracing.
+PR 7 landing empty is deliberate: its reviewer should be able to approve the config
+plumbing without forming an opinion on tracing.
 
 ### Track D — propagation (depends on PRs 5 and 8)
 
 | PR | Contents | Size | Review focus |
 |---|---|---|---|
-| **10** | `TraceContextRequestControl` + decoder + tests. No injection or extraction | ~250 | `isCritical()` returns `false`, with a test. Pure protocol — no telemetry logic to distract |
-| **11** | Client injection, opt-in `Option`, default off | ~150 | |
-| **12** | Server extraction + the trust allowlist | ~250 | **Security review.** Isolated so the trust boundary gets looked at on its own |
+| **10** | `TraceContextCodec` + `TraceContextRequestControl` + tests | ~250 | `isCritical()` returns `false`, with a test. Pure wire format |
+| **11** | Client injection — span context, not caller context — opt-in, default off | ~150 | A test asserting the server span is a child, not a sibling |
+| **12** | Server extraction from `org.opends.server.types.Control` + trust allowlist | ~300 | Security review, isolated so the trust boundary is looked at on its own |
 
-PR 10 must not merge before the OID arc is decided. PR 12 is the one PR in this plan that
-warrants a security reviewer rather than a normal one.
+PR 10 must not merge before the OID arc is decided.
 
 ### Track E — closing out
 
 | PR | Contents | Size |
 |---|---|---|
-| **13** | Module README: enabling under the OTel agent and the Datadog agent, config reference, the attribute table as user-facing docs | ~200 |
+| **13** | Module README: enabling under the OTel and Datadog agents, config reference, the attribute table as user-facing docs, recommended `service.name` / `service.version`, and what the server span duration means | ~250 |
 
 ### Merge order and parallelism
 
@@ -495,32 +581,34 @@ warrants a security reviewer rather than a normal one.
                   └──► 7 ──► 8 ──► 9 ──┘          └──► 12 ──┴──► 13
 ```
 
-Tracks B and C are independent once PR 3 lands, so two engineers can run them in parallel
-without touching the same files — B is confined to `wrends-telemetry`, C to
-`opendj-server-legacy` plus packaging.
+Tracks B and C are independent once PR 3 lands and touch disjoint files — B is confined to
+`wrends-telemetry`, C to `opendj-server-legacy` plus packaging.
 
-Thirteen PRs averaging ~300 lines. If that is more ceremony than the team wants, the
-defensible consolidations are 1+2+3 (the module) and 7+8+9 (the server), taking it to
-seven. The splits worth keeping under any consolidation are **4 from 5** (delegation before
-spans) and **12 on its own** (the trust boundary).
+Thirteen PRs averaging ~300 lines. Defensible consolidations are 1+2+3 and 7+8+9, taking it
+to seven. The splits worth keeping under any consolidation are 4 from 5, and 12 on its own.
 
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
-| Tracer captured before the SDK installs → permanent silence | lazy resolution + injectable `OpenTelemetry`; a test asserting spans arrive after late SDK install |
-| `close()` swallowing error status | `completed` flag marks unfinished spans ERROR; call-site pattern documented once |
-| Critical-flag mistake breaks ops against non-instrumented servers | `isCritical()` hardcoded `false`, covered by a test |
+| A stored `Scope` leaks across the request/response thread boundary | store `Span` + `Context` only; explicit parenting; no long-lived `Scope` |
+| A span held open for a persistent search for hours | detect the persistent-search control and skip tracing |
+| The server span means less than reviewers assume | document it as processing latency, in the README and the config reference |
+| Tracer captured before the SDK installs, producing permanent silence | lazy resolution + injectable `OpenTelemetry`; a test asserting spans arrive after late SDK install |
+| Client and server spans end up siblings | inject the span context, not the caller context; asserted by a test in PR 11 |
+| Critical-flag mistake breaks operations against non-instrumented servers | `isCritical()` hardcoded `false`, covered by a test |
 | PII leaking through DNs or filters | structural obfuscator that cannot reach values; filters off by default; a test asserting no raw DN appears in any exported span |
+| Unbounded attribute construction from attacker-influenced input | hard limits on DN length, filter depth and control count, with defined truncation |
+| Obfuscation cost on sampled-out spans | `span.isRecording()` guard before every expensive computation |
 | Result-code error set floods dashboards | explicit exclusion set, configurable |
-| Client and server vocabularies drift | single module; a test asserting both paths emit identical attribute keys |
-| Admin-framework config plumbing is unfamiliar | budget it explicitly; `opendj-server-example-plugin` is the working template |
-| Span schema churn leaking into third-party code | keep out of `opendj-bom`, mark packages internal |
+| Span schema churn leaking into third-party code | `.internal` package split; out of `opendj-bom`; public surface marked experimental |
 
 ## Open questions
 
-1. Which OID arc for `TraceContextRequestControl`? Needed before phase 4.
-2. Should the publisher ship inside the server distribution by default (disabled), or as a
+1. Which OID arc for the trace-context control? Needed before PR 10.
+2. Does a `db.system.name` shim materially improve Datadog classification? Decide in
+   phase 5 with evidence; adopt only server-side, configurable, defaulting off.
+3. Should the publisher ship inside the server distribution by default (disabled), or as a
    separately installed extension?
-3. Metrics as well as traces? The `AccessLogPublisher` hooks would support operation
-   counters and latency histograms cheaply — but that is scope beyond this plan.
+4. Is full-handling server latency, past `sendResponse()`, worth an operation-dispatch call
+   site in a follow-up?
