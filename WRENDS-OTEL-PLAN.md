@@ -421,6 +421,89 @@ consumer, and it is the side that cannot be fixed later by editing application c
 Deferred beyond this plan: `backend.*` child spans, metrics, and any instrumentation of
 `opendj-server`.
 
+## Pull request breakdown
+
+Two rules make every PR below independently mergeable:
+
+1. **Every PR leaves the build green.** No PR depends on a later one to compile or pass.
+2. **Nothing emits a span until an operator configures it.** The module is inert on the
+   classpath; the client wrapper is opt-in by construction (the application chooses to
+   wrap); the server publisher is disabled until an admin config entry exists. There is no
+   big-bang merge and no flag-flip PR — the default stays off through the whole sequence.
+
+Consequence: PRs 1–11 can all land on `main` without changing the behaviour of a running
+directory. The first behaviour change happens when someone edits their config.
+
+### Track A — the module (no consumers, zero runtime impact)
+
+| PR | Contents | Size | Review focus |
+|---|---|---|---|
+| **1** | `wrends-telemetry` module: pom, reactor entry, `${opentelemetry.version}` + root `dependencyManagement`, bundle plugin, `THIRD-PARTY.properties`. Plus the vocabulary: `LdapAttributes`, `LdapSpanNames`, `LdapResultCodes`, `LdapControlNames` | ~400 | **The span schema.** This is the only decision here that is expensive to reverse — review it against the plan doc, not the code |
+| **2** | `ObfuscationPolicy`, `Dns`, `Filters` (client adapter) | ~300 | The PII boundary. Must include a test asserting the obfuscator never calls `AVA.getAttributeValue()` |
+| **3** | `DirectoryTelemetry`, `LdapOperationSpan` | ~250 | Lazy tracer resolution, injectable `OpenTelemetry`, the `completed` flag; tests against an in-memory exporter |
+
+PRs 1–3 can be squashed into one ~1000-line "the telemetry module" PR if the team prefers
+fewer. Splitting buys focused review on the two risky parts — 2 is where PII leaks, 3 is
+where the silent-failure modes live — and both get lost inside a large constants-heavy diff.
+
+### Track B — client (depends on PR 3)
+
+| PR | Contents | Size | Review focus |
+|---|---|---|---|
+| **4** | `TelemetryConnection` extending `AbstractAsynchronousConnection` + `TelemetryConnectionFactory`, **delegation only, no spans**. Test exercising every `Connection` method through the wrapper | ~500 | Delegation completeness. This is where the `AbstractConnectionWrapper` trap lives — isolating it means "does it delegate everything?" is answered before "are the spans right?" |
+| **5** | Span creation, attributes, completion via `thenOnResultOrException`, `SearchResultHandler` wrapping, `Option` config | ~400 | Async lifecycle; the Grizzly-thread completion path |
+| **6** | `LDAP connect` and `LDAP pool acquire` spans (wrapping `LDAPConnectionFactory` / `CachedConnectionPool`) | ~200 | That the two are never conflated |
+
+Splitting 4 from 5 is the highest-value split in the whole sequence. A wrapper that misses
+a delegation is a correctness bug in the *application*, not just missing telemetry, and it
+is invisible in a diff that also introduces span logic.
+
+### Track C — server (depends on PR 3; parallel with Track B)
+
+| PR | Contents | Size | Review focus |
+|---|---|---|---|
+| **7** | `OpenTelemetryAccessLogPublisher` + `*Configuration.xml`, `Package.xml`, schema LDIF — registers and configures, **emits nothing** | ~400 | Admin-framework plumbing. Route to a reviewer who knows that framework; they should not have to read span logic |
+| **8** | Span start/end in the log hooks, `Operation.setAttachment` carry, attributes, server-side `Filters` adapter | ~400 | Request/response hook pairing and the thread-handoff assumption |
+| **9** | `opendj-packages` wiring into the server distribution | ~50 | Packaging only |
+
+PR 7 landing empty is deliberate. The config plumbing is the least familiar part of the
+work, and a reviewer who knows the admin framework should be able to approve it without
+forming an opinion on tracing.
+
+### Track D — propagation (depends on PRs 5 and 8)
+
+| PR | Contents | Size | Review focus |
+|---|---|---|---|
+| **10** | `TraceContextRequestControl` + decoder + tests. No injection or extraction | ~250 | `isCritical()` returns `false`, with a test. Pure protocol — no telemetry logic to distract |
+| **11** | Client injection, opt-in `Option`, default off | ~150 | |
+| **12** | Server extraction + the trust allowlist | ~250 | **Security review.** Isolated so the trust boundary gets looked at on its own |
+
+PR 10 must not merge before the OID arc is decided. PR 12 is the one PR in this plan that
+warrants a security reviewer rather than a normal one.
+
+### Track E — closing out
+
+| PR | Contents | Size |
+|---|---|---|
+| **13** | Module README: enabling under the OTel agent and the Datadog agent, config reference, the attribute table as user-facing docs | ~200 |
+
+### Merge order and parallelism
+
+```
+  1 ──► 2 ──► 3 ──┬──► 4 ──► 5 ──► 6 ──┐
+                  │                     ├──► 10 ──┬──► 11 ──┐
+                  └──► 7 ──► 8 ──► 9 ──┘          └──► 12 ──┴──► 13
+```
+
+Tracks B and C are independent once PR 3 lands, so two engineers can run them in parallel
+without touching the same files — B is confined to `wrends-telemetry`, C to
+`opendj-server-legacy` plus packaging.
+
+Thirteen PRs averaging ~300 lines. If that is more ceremony than the team wants, the
+defensible consolidations are 1+2+3 (the module) and 7+8+9 (the server), taking it to
+seven. The splits worth keeping under any consolidation are **4 from 5** (delegation before
+spans) and **12 on its own** (the trust boundary).
+
 ## Risks
 
 | Risk | Mitigation |
